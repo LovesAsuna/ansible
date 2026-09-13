@@ -1,0 +1,6 @@
+- name: test
+  hosts: all[0]
+  tasks:
+    - name: debug
+      ansible.builtin.debug: 
+        msg: "{{ansible_facts}}"

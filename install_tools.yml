@@ -1,0 +1,116 @@
+---
+- name: 批量安装 GitHub 工具
+  hosts: "all"
+  become: true
+  #become_user: root
+  vars:
+    install_dir: /usr/local/bin
+    tools:
+      - name: fzf
+        repo: junegunn/fzf
+        check_cmd: "fzf --version 2>/dev/null | awk '{print $1}'"
+        asset_regex: "fzf-.*-linux_amd64\\.tar\\.gz$"
+        binary_path: fzf  # 解压后的二进制文件路径
+
+      - name: bat
+        repo: sharkdp/bat
+        check_cmd: "bat --version 2>/dev/null | grep -oP 'bat \\K[0-9.]+'"
+        asset_regex: "bat-v.*-x86_64-unknown-linux-gnu\\.tar\\.gz$"
+        binary_path: "bat-v*/bat"  # 在子目录中
+
+      - name: atuin
+        repo: atuinsh/atuin
+        check_cmd: "atuin --version 2>/dev/null | grep -oP 'atuin \\K[0-9.]+'"
+        asset_regex: "atuin-x86_64-unknown-linux-gnu\\.tar\\.gz$"
+        binary_path: "atuin-*/atuin"
+
+      - name: eza
+        repo: eza-community/eza
+        check_cmd: "eza --version 2>/dev/null | head -n2 | grep -oP 'v\\K[0-9.]+'"
+        asset_regex: "eza_x86_64-unknown-linux-gnu\\.tar\\.gz$"
+        binary_path: eza
+
+      - name: btop
+        repo: aristocratos/btop
+        check_cmd: "btop --version 2>/dev/null | sed 's/\\x1b\\[[0-9;]*m//g' | grep -oP 'btop version: \\K[0-9.]+'"
+        asset_regex: "btop-x86_64-linux-musl\\.tbz$"
+        binary_path: "btop/bin/btop"
+        is_bz2: true
+
+      - name: xh
+        repo: ducaale/xh
+        check_cmd: "xh --version 2>/dev/null | grep -oP 'xh \\K[0-9.]+'"
+        asset_regex: "xh-v.*-x86_64-unknown-linux-musl\\.tar\\.gz$"
+        binary_path: "xh-v*/xh"
+
+      - name: fd
+        repo: sharkdp/fd
+        check_cmd: "fd --version 2>/dev/null | grep -oP 'fd \\K[0-9.]+'"
+        asset_regex: "fd-v.*-x86_64-unknown-linux-gnu\\.tar\\.gz$"
+        binary_path: "fd-v*/fd"
+
+      - name: procs
+        repo: dalance/procs
+        check_cmd: "procs --version 2>/dev/null | grep -oP 'procs \"\\K[0-9.]+'"
+        asset_regex: "procs-v.*-x86_64-linux\\.zip$"
+        is_zip: true
+        binary_path: procs
+
+      - name: zoxide
+        repo: ajeetdsouza/zoxide
+        check_cmd: "zoxide --version 2>/dev/null | grep -oP 'zoxide \\K[0-9.]+'"
+        asset_regex: "zoxide-.*-x86_64-unknown-linux-musl\\.tar\\.gz$"
+        binary_path: zoxide
+
+      - name: yq
+        repo: mikefarah/yq
+        check_cmd: "yq --version 2>/dev/null | grep -oP 'version v\\K[0-9.]+'"
+        asset_regex: "yq_linux_amd64\\.tar\\.gz$"
+        binary_path: yq_linux_amd64
+        rename_to: yq
+
+      - name: q
+        repo: natesales/q
+        check_cmd: "q --version 2>/dev/null | grep -oP 'q version \\K[0-9.]+'"
+        asset_regex: "q_.*_linux_amd64\\.tar\\.gz$"
+        binary_path: q
+
+  tasks:
+    - name: 检查工具当前版本
+      ansible.builtin.shell: "{{ item.check_cmd }}"
+      loop: "{{ tools }}"
+      loop_control:
+        label: "{{ item.repo }}"
+      register: tool_versions
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+    - name: 打印工具当前版本
+      ansible.builtin.debug: 
+        msg: "{{ item.item.repo + ': ' + item.stdout }}"
+      loop: "{{ tool_versions.results }}"
+      loop_control:
+        label: "{{ item.item.repo }}"
+
+    - name: 获取最新版本信息
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ item.repo }}/releases/latest"
+        headers:
+          Authorization: "{{ 'token ' + GITHUB_TOKEN if GITHUB_TOKEN is defined else omit }}"
+        return_content: true
+      loop: "{{ tools }}"
+      loop_control:
+        label: "{{ item.repo }}"
+      register: latest_releases
+
+    - name: 下载并安装需要更新的工具
+      include_tasks: install_tool.yml
+      loop: "{{ tools | zip(tool_versions.results, latest_releases.results) | list }}"
+      no_log: true
+      loop_control:
+        loop_var: tool_data
+        label: "{{ tool_data.0.repo }}"
+      when: >
+        tool_data.1.stdout | default('0.0.0') !=
+        tool_data.2.json.tag_name | regex_replace('^v', '')

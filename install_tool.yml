@@ -1,0 +1,119 @@
+---
+- name: 设置工具信息
+  ansible.builtin.set_fact:
+    tool: "{{ tool_data.0 }}"
+    current_ver: "{{ tool_data.1.stdout | default('未安装') }}"
+    latest_ver: "{{ tool_data.2.json.tag_name | regex_replace('^v', '') }}"
+    download_url: "{{ tool_data.2.json.assets | selectattr('name', 'match', tool_data.0.asset_regex) | map(attribute='browser_download_url') | first }}"
+    work_dir: "/tmp/{{ tool_data.0.name }}_install"
+
+- name: 显示更新信息
+  ansible.builtin.debug:
+    msg: "更新 {{ tool.name }}: {{ current_ver }} -> {{ latest_ver }}"
+
+- name: 创建工具工作目录
+  ansible.builtin.file:
+    path: "{{ work_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: 确定下载文件类型
+  ansible.builtin.set_fact:
+    is_zip: "{{ tool.is_zip | default(false) }}"
+    is_bz2: "{{ tool.is_bz2 | default(false) }}"
+    download_file: "{{ work_dir }}/{{ download_url | basename }}"
+
+- name: 下载工具
+  ansible.builtin.get_url:
+    url: "{{ 'https://gh-proxy.com/' + download_url }}"
+    dest: "{{ download_file }}"
+    mode: '0644'
+    timeout: 300
+  register: download_result
+  retries: 3
+  delay: 5
+  until: download_result is succeeded
+
+- name: 解压 tar.gz 文件
+  ansible.builtin.unarchive:
+    src: "{{ download_file }}"
+    dest: "{{ work_dir }}"
+    remote_src: true
+  when: not is_zip and not is_bz2
+
+- name: 解压 zip 文件
+  ansible.builtin.unarchive:
+    src: "{{ download_file }}"
+    dest: "{{ work_dir }}"
+    remote_src: true
+  when: is_zip
+
+- name: 解压 bz2 文件
+  ansible.builtin.command:
+    cmd: "tar -xjf {{ download_file }} -C {{ work_dir }}"
+  when: is_bz2
+
+- name: 查找二进制文件（无通配符路径）
+  ansible.builtin.find:
+    paths: "{{ work_dir }}"
+    patterns: "{{ tool.binary_path | basename }}"
+    recurse: true
+    file_type: file
+  register: binary_files
+  when: "'*' not in tool.binary_path"
+
+- name: 使用通配符查找二进制文件
+  ansible.builtin.shell: |
+    find {{ work_dir }} -path "{{ work_dir }}/{{ tool.binary_path }}" -type f | head -n 1
+  register: binary_wildcard
+  changed_when: false
+  when: "'*' in tool.binary_path"
+
+- name: 设置二进制文件源路径
+  ansible.builtin.set_fact:
+    binary_source: >-
+      {{
+        binary_wildcard.stdout if '*' in tool.binary_path
+        else (binary_files.files[0].path if binary_files.files | default([]) | length > 0
+        else work_dir + '/' + tool.binary_path)
+      }}
+
+- name: 检查二进制文件是否存在
+  ansible.builtin.stat:
+    path: "{{ binary_source }}"
+  register: binary_stat
+
+- name: 失败如果找不到二进制文件
+  ansible.builtin.fail:
+    msg: "无法找到 {{ tool.name }} 的二进制文件，期望路径：{{ binary_source }}"
+  when: not binary_stat.stat.exists
+
+- name: 设置目标文件名
+  ansible.builtin.set_fact:
+    target_name: "{{ tool.rename_to | default(tool.name) }}"
+
+- name: 安装到系统目录
+  ansible.builtin.copy:
+    src: "{{ binary_source }}"
+    dest: "{{ install_dir }}/{{ target_name }}"
+    mode: '0755'
+    remote_src: true
+  become: true
+  become_user: root         # 明确指定
+  become_method: sudo       # 明确指定方法
+
+- name: 验证安装
+  ansible.builtin.command: "{{ tool.check_cmd }}"
+  changed_when: false
+  register: verify_result
+  failed_when: false
+
+- name: 显示安装结果
+  ansible.builtin.debug:
+    msg: "{{ tool.name }} 安装成功，版本：{{ verify_result.stdout }}"
+  when: verify_result.rc == 0
+
+- name: 清理临时文件
+  ansible.builtin.file:
+    path: "{{ work_dir }}"
+    state: absent
