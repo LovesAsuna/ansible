@@ -1,0 +1,178 @@
+---
+# 安装单个需要升级的工具。
+# 输入：tool_data，由 install_tools.yml 传入，依次包含工具配置、当前版本结果和 Release API 结果。
+# 结果：将匹配到的二进制文件安装到 install_dir，并验证安装后的版本。
+
+- name: 设置工具基本信息和匹配发布资产
+  ansible.builtin.set_fact:
+    tool: "{{ tool_data.0 }}"
+    current_ver: "{{ tool_data.1.stdout | default('未安装', true) | trim }}"
+    latest_ver: "{{ tool_data.2.json.tag_name | regex_replace('^v', '') }}"
+    matched_assets: >-
+      {{
+        tool_data.2.json.assets
+        | selectattr('name', 'match', tool_data.0.asset_regex)
+        | list
+      }}
+    available_asset_names: >-
+      {{
+        tool_data.2.json.assets
+        | map(attribute='name')
+        | list
+      }}
+    work_dir: "/tmp/{{ tool_data.0.name }}_install"
+
+# 必须确保只匹配一个资产，避免空列表上的 first 报出难以定位的错误，
+# 同时防止正则过宽时静默选择错误的下载包。
+- name: 校验发布资产匹配结果
+  ansible.builtin.assert:
+    that:
+      - matched_assets | length == 1
+    fail_msg: >-
+      {{ tool.repo }} {{ latest_ver }} 的资产匹配失败；
+      正则={{ tool.asset_regex }}；
+      匹配数量={{ matched_assets | length }}；
+      可用资产={{ available_asset_names | join(', ') }}
+    success_msg: >-
+      {{ tool.repo }} {{ latest_ver }} 匹配资产：{{ matched_assets[0].name }}
+
+- name: 设置下载地址
+  ansible.builtin.set_fact:
+    download_url: "{{ matched_assets[0].browser_download_url }}"
+
+- name: 显示更新信息
+  ansible.builtin.debug:
+    msg: "更新 {{ tool.name }}: {{ current_ver }} -> {{ latest_ver }}"
+
+# 每次安装前清空工作目录，避免上次失败遗留的文件被误认为本次解压结果。
+- name: 清理旧的工具工作目录
+  ansible.builtin.file:
+    path: "{{ work_dir }}"
+    state: absent
+
+- name: 创建工具工作目录
+  ansible.builtin.file:
+    path: "{{ work_dir }}"
+    state: directory
+    mode: '0755'
+
+# 根据实际下载文件名识别压缩格式；无已知压缩扩展名时按独立二进制文件处理。
+- name: 确定下载文件和压缩格式
+  ansible.builtin.set_fact:
+    is_zip: >-
+      {{ (download_url | lower | regex_search('\.zip$')) is not none }}
+    is_bz2: >-
+      {{ (download_url | lower | regex_search('\.(tbz|tar\.bz2)$')) is not none }}
+    is_tar_gz: >-
+      {{ (download_url | lower | regex_search('\.(tar\.gz|tgz)$')) is not none }}
+    download_file: "{{ work_dir }}/{{ download_url | basename }}"
+
+- name: 下载工具
+  ansible.builtin.get_url:
+    url: "{{ 'https://gh-proxy.com/' + download_url }}"
+    dest: "{{ download_file }}"
+    mode: '0644'
+    timeout: 300
+  register: download_result
+  retries: 3
+  delay: 5
+  until: download_result is succeeded
+
+- name: 解压 tar.gz 文件
+  ansible.builtin.unarchive:
+    src: "{{ download_file }}"
+    dest: "{{ work_dir }}"
+    remote_src: true
+  when: is_tar_gz
+
+- name: 解压 zip 文件
+  ansible.builtin.unarchive:
+    src: "{{ download_file }}"
+    dest: "{{ work_dir }}"
+    remote_src: true
+  when: is_zip
+
+- name: 解压 bzip2 文件
+  ansible.builtin.command:
+    argv:
+      - tar
+      - -xjf
+      - "{{ download_file }}"
+      - -C
+      - "{{ work_dir }}"
+  when: is_bz2
+
+- name: 查找二进制文件（无通配符路径）
+  ansible.builtin.find:
+    paths: "{{ work_dir }}"
+    patterns: "{{ tool.binary_path | basename }}"
+    recurse: true
+    file_type: file
+  register: binary_files
+  when: "'*' not in tool.binary_path"
+
+- name: 使用通配符查找二进制文件
+  ansible.builtin.shell: >-
+    find {{ work_dir | quote }}
+    -path {{ (work_dir + '/' + tool.binary_path) | quote }}
+    -type f -print -quit
+  register: binary_wildcard
+  changed_when: false
+  when: "'*' in tool.binary_path"
+
+- name: 设置二进制文件源路径
+  ansible.builtin.set_fact:
+    binary_source: >-
+      {{
+        binary_wildcard.stdout
+        if '*' in tool.binary_path
+        else (
+          binary_files.files[0].path
+          if binary_files.files | default([]) | length > 0
+          else work_dir + '/' + tool.binary_path
+        )
+      }}
+
+- name: 检查二进制文件是否存在
+  ansible.builtin.stat:
+    path: "{{ binary_source }}"
+  register: binary_stat
+
+- name: 找不到二进制文件时终止安装
+  ansible.builtin.fail:
+    msg: "无法找到 {{ tool.name }} 的二进制文件，期望路径：{{ binary_source }}"
+  when: not binary_stat.stat.exists
+
+- name: 设置目标文件名
+  ansible.builtin.set_fact:
+    target_name: "{{ tool.rename_to | default(tool.name) }}"
+
+- name: 安装到系统目录
+  ansible.builtin.copy:
+    src: "{{ binary_source }}"
+    dest: "{{ install_dir }}/{{ target_name }}"
+    mode: '0755'
+    remote_src: true
+  become: true
+  become_user: root
+  become_method: sudo
+
+# check_cmd 包含管道和重定向，因此必须使用 shell 模块。
+- name: 验证安装
+  ansible.builtin.shell: "{{ tool.check_cmd }}"
+  environment:
+    PATH: "{{ install_dir }}:{{ ansible_env.PATH }}"
+  register: verify_result
+  changed_when: false
+  failed_when: >-
+    verify_result.rc != 0 or
+    (verify_result.stdout | trim) != latest_ver
+
+- name: 显示安装结果
+  ansible.builtin.debug:
+    msg: "{{ tool.name }} 安装成功，版本：{{ verify_result.stdout | trim }}"
+
+- name: 清理临时文件
+  ansible.builtin.file:
+    path: "{{ work_dir }}"
+    state: absent
